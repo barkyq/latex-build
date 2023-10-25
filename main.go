@@ -5,24 +5,43 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
+	"encoding/base64"
+	"flag"
 	"fmt"
 	"io"
+	"net/textproto"
+
+	"mime/multipart"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 
 	git "github.com/go-git/go-git/v5"
 
-	// "github.com/go-git/go-git/v5/plumbing"
-	// "github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
+var message_header_list = []string{"From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"}
+
+var subject_flag = flag.String("s", "", "subject")
+var repository_flag = flag.String("r", ".", "repository")
+
 func main() {
+	flag.Parse()
+	if *subject_flag == "" {
+		if wd, e := os.Getwd(); e != nil {
+			panic(e)
+		} else {
+			*subject_flag = filepath.Base(wd)
+		}
+	}
+
 	var r *git.Repository
-	if re, e := git.PlainOpen("~/projects/chord_conjecture/"); e != nil {
+	if re, e := git.PlainOpen(*repository_flag); e != nil {
 		panic(e)
 	} else {
 		r = re
@@ -107,12 +126,16 @@ func main() {
 	}
 
 	cid := fmt.Sprintf("%s", commit_hash.String()[:10])
-	if gzbuf, e := to_gzip(buf); e != nil {
+	gzbuf, e := to_gzip(buf)
+	if e != nil {
 		panic(e)
-	} else if f, e := os.Create(fmt.Sprintf("source-%s-%s.tar.gz", cid, commit_time.Format("01-02"))); e == nil {
-		io.Copy(f, gzbuf)
 	}
 
+	if _, e := os.Stat(filepath.Join(tmpdir, "main.tex")); e != nil {
+		panic("file main.tex cannot be found")
+	}
+
+	fmt.Println("compiling")
 	cmd := exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
@@ -136,29 +159,150 @@ func main() {
 	}
 
 	// citation command was present, run bibtex
+
+	fmt.Println("bibtex")
 	cmd = exec.Command("bibtex", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
 		panic(e)
 	}
+
+	fmt.Println("compiling")
 	cmd = exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
 		panic(e)
 	}
 skip:
+	fmt.Println("compiling")
 	cmd = exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
 		panic(e)
 	}
+
+	// end of compiling document
+
+	pdfbuf := bytes.NewBuffer(nil)
+
 	if f, e := os.Open(filepath.Join(tmpdir, "main.pdf")); e != nil {
 		panic(e)
-	} else if g, e := os.Create(fmt.Sprintf("build-%s-%s.pdf", cid, commit_time.Format("01-02"))); e != nil {
+	} else if _, e := io.Copy(pdfbuf, f); e != nil {
 		panic(e)
-	} else if _, e := io.Copy(g, f); e != nil {
+	} else if e := f.Close(); e != nil {
 		panic(e)
 	}
+
+	g, _ := os.Create(fmt.Sprintf("build-%s-%s.eml", cid, commit_time.Format("01-02")))
+	defer g.Close()
+	m := multipart.NewWriter(g)
+	randy := rand.Reader
+	m_id := make([]byte, 18)
+	time_unix := time.Now().Unix()
+	for i := 0; i < 4; i++ {
+		m_id[i] = byte(time_unix)
+		time_unix = time_unix / 256
+	}
+	randy.Read(m_id[4:])
+
+	message_headers := make(map[string]string)
+	message_headers["From"] = "barkyq-git-bot <barkyq-git-bot@liouville.net>"
+	message_headers["To"] = "barkyq-git-bot <barkyq-git-bot@liouville.net>"
+	message_headers["Subject"] = *subject_flag
+	message_headers["Date"] = time.Now().Format(time.RFC1123Z)
+	message_headers["MIME-Version"] = "1.1"
+	message_headers["Message-ID"] = fmt.Sprintf("%08x-%04x-%04x-%04x-%016x@liouville.net", m_id[0:4], m_id[4:6], m_id[6:8], m_id[8:10], m_id[10:18])
+	message_headers["Content-Type"] = fmt.Sprintf("multipart/mixed; boundary=\"%s\"", m.Boundary())
+
+	for _, key := range message_header_list {
+		if a, ok := message_headers[key]; ok {
+			fmt.Fprintf(g, "%s: %s\r\n", key, a)
+		}
+	}
+	g.Write([]byte{'\r', '\n'})
+
+	// text part
+	text_header := make(textproto.MIMEHeader)
+	text_header.Add("Content-Type", "text/plain")
+	if w, e := m.CreatePart(text_header); e != nil {
+		panic(e)
+	} else {
+		fmt.Fprintf(w, "%s\n%s\n\n%s\n", commit_object.Author.String(), commit_object.Author.When.Format("Mon Jan 02 15:04:05 2006 -0700"), commit_object.Message)
+	}
+
+	// pdf attachment part
+	pdf_header := make(textproto.MIMEHeader)
+	pdf_header.Add("Content-Transfer-Encoding", "base64")
+	pdf_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=build-%s-%s.pdf", cid, commit_time.Format("01-02")))
+	pdf_header.Add("Content-Type", "application/pdf")
+	if w, e := m.CreatePart(pdf_header); e != nil {
+		panic(e)
+	} else {
+		rp, wp := io.Pipe()
+		bw := base64.NewEncoder(base64.StdEncoding, wp)
+		go func() {
+			if _, e := io.Copy(bw, pdfbuf); e != nil {
+				panic(e)
+			} else if e := bw.Close(); e != nil {
+				panic(e)
+			} else if e := wp.Close(); e != nil {
+				panic(e)
+			}
+		}()
+		buffer := make([]byte, 76)
+		for {
+			n, _ := rp.Read(buffer)
+			w.Write(buffer[:n])
+			if n < 76 {
+				k, e := rp.Read(buffer[n:])
+				if e != nil {
+					break
+				}
+				w.Write(buffer[n : n+k])
+			}
+			w.Write([]byte{'\r', '\n'})
+		}
+		w.Write([]byte{'\r', '\n'})
+	}
+
+	// tar attachment part
+	targz_header := make(textproto.MIMEHeader)
+	targz_header.Add("Content-Transfer-Encoding", "base64")
+	targz_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=source-%s-%s.tar.gz", cid, commit_time.Format("01-02")))
+	targz_header.Add("Content-Type", "application/gzip")
+	if w, e := m.CreatePart(targz_header); e != nil {
+		panic(e)
+	} else {
+		rp, wp := io.Pipe()
+		bw := base64.NewEncoder(base64.StdEncoding, wp)
+		go func() {
+			if _, e := io.Copy(bw, gzbuf); e != nil {
+				panic(e)
+			} else if e := bw.Close(); e != nil {
+				panic(e)
+			} else if e := wp.Close(); e != nil {
+				panic(e)
+			}
+		}()
+		buffer := make([]byte, 76)
+		for {
+			n, _ := rp.Read(buffer)
+			w.Write(buffer[:n])
+			if n < 76 {
+				k, e := rp.Read(buffer[n:])
+				if e != nil {
+					break
+				}
+				w.Write(buffer[n : n+k])
+			}
+			w.Write([]byte{'\r', '\n'})
+		}
+		w.Write([]byte{'\r', '\n'})
+	}
+	if e := m.Close(); e != nil {
+		panic(e)
+	}
+
 	if e := os.RemoveAll(tmpdir); e != nil {
 		panic(e)
 	}
