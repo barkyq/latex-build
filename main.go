@@ -26,12 +26,28 @@ import (
 )
 
 var message_header_list = []string{"From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"}
-
 var subject_flag = flag.String("s", "", "subject")
 var repository_flag = flag.String("r", ".", "repository")
 
+type Exclusions []string
+
+var exclusions Exclusions
+
+func (xs *Exclusions) String() (str string) {
+	for _, val := range *xs {
+		str += fmt.Sprintf(" %s", val)
+	}
+	return
+}
+func (xs *Exclusions) Set(value string) error {
+	*xs = append(*xs, value)
+	return nil
+}
+
 func main() {
+	flag.Var(&exclusions, "x", "set calendars (can be used multiple times)")
 	flag.Parse()
+
 	if *subject_flag == "" {
 		if wd, e := os.Getwd(); e != nil {
 			panic(e)
@@ -84,14 +100,16 @@ func main() {
 	}
 
 	if e := files.ForEach(func(f *object.File) error {
-		if !filename_filter(f.Name) {
+		if !filename_filter(f.Name, exclusions) {
 			return nil
 		}
 		if r, e := f.Reader(); e != nil {
 			return e
 		} else {
 			gname := filepath.Join(tmpdir, f.Name)
-			if g, e := os.Create(gname); e != nil {
+			if e := os.MkdirAll(filepath.Dir(gname), os.ModePerm); e != nil {
+				return e
+			} else if g, e := os.Create(gname); e != nil {
 				return e
 			} else if n, e := io.Copy(g, r); e != nil {
 				return e
@@ -308,15 +326,13 @@ skip:
 	}
 }
 
-var filenames = []string{"main.tex", "citations.bib"}
-
-func filename_filter(s string) bool {
-	for _, f := range filenames {
-		if s == f {
-			return true
+func filename_filter(s string, xs Exclusions) bool {
+	for _, f := range xs {
+		if strings.HasPrefix(s, f) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func to_gzip(r io.Reader) (io.Reader, error) {
