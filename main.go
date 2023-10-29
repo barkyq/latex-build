@@ -25,21 +25,23 @@ import (
 )
 
 var message_header_list = []string{"From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"}
+
 var subject_flag = flag.String("s", "", "subject")
 var repository_flag = flag.String("r", ".", "repository")
+var release_flag = flag.Bool("release", false, "generate arXiv release")
 
-type Exclusions []string
+type SFlags []string
 
-var exclusions Exclusions
+var exclusions SFlags
 
-func (xs *Exclusions) String() (str string) {
+func (xs *SFlags) String() (str string) {
 	for _, val := range *xs {
 		str += fmt.Sprintf(" %s", val)
 	}
 	return
 }
 
-func (xs *Exclusions) Set(value string) error {
+func (xs *SFlags) Set(value string) error {
 	*xs = append(*xs, value)
 	return nil
 }
@@ -54,6 +56,9 @@ func main() {
 		} else {
 			*subject_flag = filepath.Base(wd)
 		}
+	}
+	if *release_flag {
+		*subject_flag = *subject_flag + " [arXiv release]"
 	}
 
 	var r *git.Repository
@@ -99,10 +104,14 @@ func main() {
 		tmpdir = t
 	}
 
+	var filelist []string
 	if e := files.ForEach(func(f *object.File) error {
 		if !filename_filter(f.Name, exclusions) {
 			return nil
+		} else {
+			filelist = append(filelist, f.Name)
 		}
+
 		if r, e := f.Reader(); e != nil {
 			return e
 		} else {
@@ -113,6 +122,9 @@ func main() {
 				return e
 			} else if n, e := write_to_tmp_dir(r, g, f.Name, commit_hash.String()); e != nil {
 				return e
+			} else if *release_flag {
+				// if release, do not write anything to tar writer yet
+				return nil
 			} else if g, e := os.Open(g.Name()); e != nil {
 				return e
 			} else {
@@ -129,32 +141,97 @@ func main() {
 				} else if _, e := io.Copy(tw, g); e != nil {
 					return e
 				}
-				fmt.Println(f.Name)
+				fmt.Println("including:", f.Name)
 			}
 		}
 		return nil
 	}); e != nil {
 		panic(e)
 	}
-	if e := tw.Close(); e != nil {
+
+	if e := compile_tex_code(tmpdir); e != nil {
 		panic(e)
+	}
+
+	// end of compiling document
+	pdfbuf := bytes.NewBuffer(nil)
+
+	if f, e := os.Open(filepath.Join(tmpdir, "main.pdf")); e != nil {
+		panic(e)
+	} else if _, e := io.Copy(pdfbuf, f); e != nil {
+		panic(e)
+	} else if e := f.Close(); e != nil {
+		panic(e)
+	}
+
+	if *release_flag {
+		if e := arXiv_release(tw, tmpdir, filelist, uid, gid, commit_time); e != nil {
+			panic(e)
+		}
 	}
 
 	cid := fmt.Sprintf("%s", commit_hash.String()[:10])
-	gzbuf, e := to_gzip(buf)
-	if e != nil {
+	g, _ := os.Create(fmt.Sprintf("build-%s-%s.eml", cid, commit_time.Format("01-02")))
+	defer g.Close()
+
+	// close the tar writer (wrapping buf)
+	if e := tw.Close(); e != nil {
+		panic(e)
+	} else if gzbuf, e := to_gzip(buf); e != nil {
+		panic(e)
+	} else if e := generate_eml_file(g, commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
 		panic(e)
 	}
 
+	if e := os.RemoveAll(tmpdir); e != nil {
+		panic(e)
+	}
+}
+
+func arXiv_release(tw *tar.Writer, tmpdir string, filelist []string, uid string, gid string, commit_time time.Time) error {
+	log_bytes, e := os.ReadFile(filepath.Join(tmpdir, "main.log"))
+	if e != nil {
+		return e
+	}
+	filelist = append(filelist, "main.bbl")
+	for _, fname := range filelist {
+		if bytes.Index(log_bytes, []byte(fname)) == -1 {
+			continue
+		}
+		if f, e := os.Open(filepath.Join(tmpdir, fname)); e != nil {
+			return e
+		} else if s, e := f.Stat(); e != nil {
+			return e
+		} else {
+			hdr := &tar.Header{
+				Name:    fname,
+				Mode:    0644,
+				Size:    s.Size(),
+				Uname:   uid,
+				Gname:   gid,
+				ModTime: commit_time,
+			}
+			if e := tw.WriteHeader(hdr); e != nil {
+				return e
+			} else if _, e := io.Copy(tw, f); e != nil {
+				return e
+			}
+		}
+		fmt.Println("including:", fname)
+	}
+	return nil
+}
+
+func compile_tex_code(tmpdir string) error {
 	if _, e := os.Stat(filepath.Join(tmpdir, "main.tex")); e != nil {
-		panic("file main.tex cannot be found")
+		return fmt.Errorf("file main.tex cannot be found")
 	}
 
 	fmt.Println("compiling")
 	cmd := exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
-		panic(e)
+		return e
 	}
 	if f, e := os.Open(filepath.Join(tmpdir, "main.aux")); e == nil {
 		b := bufio.NewReader(f)
@@ -170,7 +247,7 @@ func main() {
 		}
 	} else {
 		f.Close()
-		panic(e)
+		return e
 	}
 
 	// citation command was present, run bibtex
@@ -178,36 +255,26 @@ func main() {
 	cmd = exec.Command("bibtex", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
-		panic(e)
+		return e
 	}
 
 	fmt.Println("compiling")
 	cmd = exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
-		panic(e)
+		return e
 	}
 skip:
 	fmt.Println("compiling")
 	cmd = exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
-		panic(e)
+		return e
 	}
+	return nil
+}
 
-	// end of compiling document
-	pdfbuf := bytes.NewBuffer(nil)
-
-	if f, e := os.Open(filepath.Join(tmpdir, "main.pdf")); e != nil {
-		panic(e)
-	} else if _, e := io.Copy(pdfbuf, f); e != nil {
-		panic(e)
-	} else if e := f.Close(); e != nil {
-		panic(e)
-	}
-
-	g, _ := os.Create(fmt.Sprintf("build-%s-%s.eml", cid, commit_time.Format("01-02")))
-	defer g.Close()
+func generate_eml_file(g io.Writer, commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
 	m := multipart.NewWriter(g)
 	randy := rand.Reader
 	m_id := make([]byte, 18)
@@ -246,7 +313,13 @@ skip:
 	// pdf attachment part
 	pdf_header := make(textproto.MIMEHeader)
 	pdf_header.Add("Content-Transfer-Encoding", "base64")
-	pdf_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=build-%s-%s.pdf", cid, commit_time.Format("01-02")))
+
+	if *release_flag {
+		pdf_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=release-%s-%s.pdf", cid, commit_time.Format("01-02")))
+	} else {
+		pdf_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=build-%s-%s.pdf", cid, commit_time.Format("01-02")))
+	}
+
 	pdf_header.Add("Content-Type", "application/pdf")
 	if w, e := m.CreatePart(pdf_header); e != nil {
 		panic(e)
@@ -281,7 +354,11 @@ skip:
 	// tar attachment part
 	targz_header := make(textproto.MIMEHeader)
 	targz_header.Add("Content-Transfer-Encoding", "base64")
-	targz_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=source-%s-%s.tar.gz", cid, commit_time.Format("01-02")))
+	if *release_flag {
+		targz_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=release-%s-%s.tar.gz", cid, commit_time.Format("01-02")))
+	} else {
+		targz_header.Add("Content-Disposition", fmt.Sprintf("attachment; filename=source-%s-%s.tar.gz", cid, commit_time.Format("01-02")))
+	}
 	targz_header.Add("Content-Type", "application/gzip")
 	if w, e := m.CreatePart(targz_header); e != nil {
 		panic(e)
@@ -312,16 +389,10 @@ skip:
 		}
 		w.Write([]byte{'\r', '\n'})
 	}
-	if e := m.Close(); e != nil {
-		panic(e)
-	}
-
-	if e := os.RemoveAll(tmpdir); e != nil {
-		panic(e)
-	}
+	return m.Close()
 }
 
-func filename_filter(s string, xs Exclusions) bool {
+func filename_filter(s string, xs []string) bool {
 	for _, f := range xs {
 		if strings.HasPrefix(s, f) {
 			return false
@@ -344,7 +415,15 @@ func write_to_tmp_dir(r io.ReadCloser, fi *os.File, name string, hash string) (n
 					n += int64(k)
 				}
 				if strings.Contains(fmt.Sprintf("%s", l), "documentclass") {
-					if k, er := fmt.Fprintf(fi, "\\usepackage{atbegshi}\n\\AtBeginShipoutNext{\\AtBeginShipoutUpperLeft{\\put(1.25in,-1in){\\makebox[0pt][l]{{\\tt %s %s}}}}}\n%%%s\n", hash[:8], time.Now().Format("15:04:05\\ 2006-01-02"), hash); er != nil {
+					if !(*release_flag) {
+						// only write the atbegshi if not an arXiv release
+						if k, er := fmt.Fprintf(fi, "\\usepackage{atbegshi}\n\\AtBeginShipoutNext{\\AtBeginShipoutUpperLeft{\\put(1.25in,-1in){\\makebox[0pt][l]{{\\tt %s %s}}}}}\n", hash[:8], time.Now().Format("15:04:05\\ 2006-01-02")); er != nil {
+							return n + int64(k), er
+						} else {
+							n += int64(k)
+						}
+					}
+					if k, er := fmt.Fprintf(fi, "%%%s\n", hash); er != nil {
 						return n + int64(k), er
 					} else {
 						n += int64(k)
