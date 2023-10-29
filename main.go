@@ -20,15 +20,15 @@ import (
 	"time"
 
 	git "github.com/go-git/go-git/v5"
-
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 var message_header_list = []string{"From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"}
 
 var subject_flag = flag.String("s", "", "subject")
-var repository_flag = flag.String("r", ".", "repository")
 var release_flag = flag.Bool("release", false, "generate arXiv release")
+var stdout_flag = flag.Bool("stdout", false, "print .eml directly to stdout")
+var no_email_flag = flag.Bool("no-email", false, "do not generate an email")
 
 type SFlags []string
 
@@ -62,11 +62,13 @@ func main() {
 	}
 
 	var r *git.Repository
-	if re, e := git.PlainOpen(*repository_flag); e != nil {
+	if re, e := git.PlainOpen("."); e != nil {
 		panic(e)
 	} else {
 		r = re
 	}
+
+	// use the commit to which HEAD is pointing
 	var commit_object *object.Commit
 	if ref, e := r.Head(); e == nil {
 		if c, e := r.CommitObject(ref.Hash()); e != nil {
@@ -141,7 +143,7 @@ func main() {
 				} else if _, e := io.Copy(tw, g); e != nil {
 					return e
 				}
-				fmt.Println("including:", f.Name)
+				fmt.Fprintln(os.Stderr, "including:", f.Name)
 			}
 		}
 		return nil
@@ -171,16 +173,33 @@ func main() {
 	}
 
 	cid := fmt.Sprintf("%s", commit_hash.String()[:10])
-	g, _ := os.Create(fmt.Sprintf("build-%s-%s.eml", cid, commit_time.Format("01-02")))
-	defer g.Close()
 
 	// close the tar writer (wrapping buf)
 	if e := tw.Close(); e != nil {
 		panic(e)
 	} else if gzbuf, e := to_gzip(buf); e != nil {
 		panic(e)
-	} else if e := generate_eml_file(g, commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
-		panic(e)
+	} else {
+		if *no_email_flag {
+			if e := generate_files(commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
+				panic(e)
+			}
+		} else {
+			var g io.Writer
+			if *stdout_flag {
+				g = os.Stdout
+			} else if !*no_email_flag {
+				if f, e := os.Create(fmt.Sprintf("build-%s-%s.eml", cid, commit_time.Format("01-02"))); e != nil {
+					panic(e)
+				} else {
+					g = f
+					defer f.Close()
+				}
+			}
+			if e := generate_eml(g, commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
+				panic(e)
+			}
+		}
 	}
 
 	if e := os.RemoveAll(tmpdir); e != nil {
@@ -217,7 +236,7 @@ func arXiv_release(tw *tar.Writer, tmpdir string, filelist []string, uid string,
 				return e
 			}
 		}
-		fmt.Println("including:", fname)
+		fmt.Fprintln(os.Stderr, "including:", fname)
 	}
 	return nil
 }
@@ -227,7 +246,7 @@ func compile_tex_code(tmpdir string) error {
 		return fmt.Errorf("file main.tex cannot be found")
 	}
 
-	fmt.Println("compiling")
+	fmt.Fprintln(os.Stderr, "compiling")
 	cmd := exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
@@ -251,21 +270,21 @@ func compile_tex_code(tmpdir string) error {
 	}
 
 	// citation command was present, run bibtex
-	fmt.Println("bibtex")
+	fmt.Fprintln(os.Stderr, "bibtex")
 	cmd = exec.Command("bibtex", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
 		return e
 	}
 
-	fmt.Println("compiling")
+	fmt.Fprintln(os.Stderr, "compiling")
 	cmd = exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
 		return e
 	}
 skip:
-	fmt.Println("compiling")
+	fmt.Fprintln(os.Stderr, "compiling")
 	cmd = exec.Command("pdflatex", "-halt-on-error", "-file-line-error", "-interaction=nonstopmode", "main")
 	cmd.Dir = tmpdir
 	if e := cmd.Run(); e != nil {
@@ -274,7 +293,41 @@ skip:
 	return nil
 }
 
-func generate_eml_file(g io.Writer, commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
+func generate_files(commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
+	// pdf attachment part
+	var pdf_file_name string
+	var targz_file_name string
+	if *release_flag {
+		pdf_file_name = fmt.Sprintf("release-%s-%s.pdf", cid, commit_time.Format("01-02"))
+		targz_file_name = fmt.Sprintf("release-%s-%s.tar.gz", cid, commit_time.Format("01-02"))
+	} else {
+		pdf_file_name = fmt.Sprintf("build-%s-%s.pdf", cid, commit_time.Format("01-02"))
+		targz_file_name = fmt.Sprintf("source-%s-%s.tar.gz", cid, commit_time.Format("01-02"))
+	}
+
+	if f, e := os.Create(pdf_file_name); e != nil {
+		panic(e)
+	} else if _, e := io.Copy(f, pdfbuf); e != nil {
+		panic(e)
+	} else if e := f.Close(); e != nil {
+		panic(e)
+	} else {
+		fmt.Fprintf(os.Stderr, "writing: %s\n", pdf_file_name)
+	}
+
+	if f, e := os.Create(targz_file_name); e != nil {
+		panic(e)
+	} else if _, e := io.Copy(f, gzbuf); e != nil {
+		panic(e)
+	} else if e := f.Close(); e != nil {
+		panic(e)
+	} else {
+		fmt.Fprintf(os.Stderr, "writing: %s\n", targz_file_name)
+	}
+	return nil
+}
+
+func generate_eml(g io.Writer, commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
 	m := multipart.NewWriter(g)
 	randy := rand.Reader
 	m_id := make([]byte, 18)
