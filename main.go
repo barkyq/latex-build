@@ -10,9 +10,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/textproto"
-
 	"mime/multipart"
+	"net/textproto"
 	"os"
 	"os/exec"
 	"os/user"
@@ -39,13 +38,14 @@ func (xs *Exclusions) String() (str string) {
 	}
 	return
 }
+
 func (xs *Exclusions) Set(value string) error {
 	*xs = append(*xs, value)
 	return nil
 }
 
 func main() {
-	flag.Var(&exclusions, "x", "set calendars (can be used multiple times)")
+	flag.Var(&exclusions, "x", "set exclusion prefixes (can be used multiple times)")
 	flag.Parse()
 
 	if *subject_flag == "" {
@@ -111,11 +111,7 @@ func main() {
 				return e
 			} else if g, e := os.Create(gname); e != nil {
 				return e
-			} else if n, e := io.Copy(g, r); e != nil {
-				return e
-			} else if e := r.Close(); e != nil {
-				return e
-			} else if e := g.Close(); e != nil {
+			} else if n, e := write_to_tmp_dir(r, g, f.Name, commit_hash.String()); e != nil {
 				return e
 			} else if g, e := os.Open(g.Name()); e != nil {
 				return e
@@ -133,6 +129,7 @@ func main() {
 				} else if _, e := io.Copy(tw, g); e != nil {
 					return e
 				}
+				fmt.Println(f.Name)
 			}
 		}
 		return nil
@@ -177,7 +174,6 @@ func main() {
 	}
 
 	// citation command was present, run bibtex
-
 	fmt.Println("bibtex")
 	cmd = exec.Command("bibtex", "main")
 	cmd.Dir = tmpdir
@@ -200,7 +196,6 @@ skip:
 	}
 
 	// end of compiling document
-
 	pdfbuf := bytes.NewBuffer(nil)
 
 	if f, e := os.Open(filepath.Join(tmpdir, "main.pdf")); e != nil {
@@ -333,6 +328,51 @@ func filename_filter(s string, xs Exclusions) bool {
 		}
 	}
 	return true
+}
+
+func write_to_tmp_dir(r io.ReadCloser, fi *os.File, name string, hash string) (n int64, e error) {
+	switch name {
+	case "main.tex":
+		rb := bufio.NewReader(r)
+		for {
+			if l, e := rb.ReadSlice('\n'); e != nil {
+				panic(e)
+			} else {
+				if k, er := fmt.Fprintf(fi, "%s", l); er != nil {
+					return n + int64(k), er
+				} else {
+					n += int64(k)
+				}
+				if strings.Contains(fmt.Sprintf("%s", l), "documentclass") {
+					if k, er := fmt.Fprintf(fi, "\\usepackage{atbegshi}\n\\AtBeginShipoutNext{\\AtBeginShipoutUpperLeft{\\put(1.25in,-1in){\\makebox[0pt][l]{{\\tt %s %s}}}}}\n%%%s\n", hash[:8], time.Now().Format("15:04:05\\ 2006-01-02"), hash); er != nil {
+						return n + int64(k), er
+					} else {
+						n += int64(k)
+					}
+					break
+				}
+			}
+		}
+		if k, er := io.Copy(fi, rb); er != nil {
+			return n + k, er
+		} else {
+			n += k
+		}
+	default:
+		if k, er := io.Copy(fi, r); er != nil {
+			return n + k, er
+		} else {
+			n += k
+		}
+	}
+	if e := r.Close(); e != nil {
+		return n, e
+	} else if e := fi.Close(); e != nil {
+		return n, e
+	} else {
+		return n, nil
+	}
+
 }
 
 func to_gzip(r io.Reader) (io.Reader, error) {
