@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net/mail"
 	"net/textproto"
 	"os"
 	"os/exec"
@@ -20,15 +21,16 @@ import (
 	"time"
 
 	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 var message_header_list = []string{"From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"}
 
-var subject_flag = flag.String("s", "", "subject")
+var subject_flag = flag.String("subject", "", "subject")
 var release_flag = flag.Bool("release", false, "generate arXiv release")
 var stdout_flag = flag.Bool("stdout", false, "print .eml directly to stdout")
-var no_email_flag = flag.Bool("no-email", false, "do not generate an email")
+var no_email_flag = flag.Bool("no-email", false, "do not generate an email, generate files instead")
 
 type SFlags []string
 
@@ -66,6 +68,15 @@ func main() {
 		panic(e)
 	} else {
 		r = re
+	}
+
+	var user_email *mail.Address
+	if conf, e := r.ConfigScoped(config.GlobalScope); e != nil {
+		panic(e)
+	} else if addr, e := mail.ParseAddress(fmt.Sprintf("%s <%s>", conf.User.Name, conf.User.Email)); e != nil {
+		panic(e)
+	} else {
+		user_email = addr
 	}
 
 	// use the commit to which HEAD is pointing
@@ -196,7 +207,7 @@ func main() {
 					defer f.Close()
 				}
 			}
-			if e := generate_eml(g, commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
+			if e := generate_eml(user_email, g, commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
 				panic(e)
 			}
 		}
@@ -327,7 +338,7 @@ func generate_files(commit_object *object.Commit, cid string, commit_time time.T
 	return nil
 }
 
-func generate_eml(g io.Writer, commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
+func generate_eml(user_email *mail.Address, g io.Writer, commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
 	m := multipart.NewWriter(g)
 	randy := rand.Reader
 	m_id := make([]byte, 18)
@@ -339,16 +350,19 @@ func generate_eml(g io.Writer, commit_object *object.Commit, cid string, commit_
 	randy.Read(m_id[4:])
 
 	message_headers := make(map[string]string)
-	message_headers["From"] = "barkyq-git-bot <barkyq-git-bot@liouville.net>"
-	message_headers["To"] = "barkyq-git-bot <barkyq-git-bot@liouville.net>"
+	message_headers["From"] = user_email.String()
+	message_headers["To"] = user_email.String()
 	message_headers["Subject"] = *subject_flag
 	message_headers["Date"] = time.Now().Format(time.RFC1123Z)
 	message_headers["MIME-Version"] = "1.1"
 	message_headers["Message-ID"] = fmt.Sprintf("%08x-%04x-%04x-%04x-%016x@liouville.net", m_id[0:4], m_id[4:6], m_id[6:8], m_id[8:10], m_id[10:18])
 	message_headers["Content-Type"] = fmt.Sprintf("multipart/mixed; boundary=\"%s\"", m.Boundary())
 
-	for _, key := range message_header_list {
+	for k, key := range message_header_list {
 		if a, ok := message_headers[key]; ok {
+			if k < 3 {
+				fmt.Fprintf(os.Stderr, "%s: %s\r\n", key, a)
+			}
 			fmt.Fprintf(g, "%s: %s\r\n", key, a)
 		}
 	}
