@@ -25,7 +25,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
-var message_header_list = []string{"From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"}
+var message_header_list = []string{"From", "To", "Cc", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"}
 
 var subject_flag = flag.String("subject", "", "subject")
 var release_flag = flag.Bool("release", false, "generate arXiv release")
@@ -35,6 +35,7 @@ var no_email_flag = flag.Bool("no-email", false, "do not generate an email, gene
 type SFlags []string
 
 var exclusions SFlags
+var recipients SFlags
 
 func (xs *SFlags) String() (str string) {
 	for _, val := range *xs {
@@ -50,6 +51,7 @@ func (xs *SFlags) Set(value string) error {
 
 func main() {
 	flag.Var(&exclusions, "x", "set exclusion prefixes (can be used multiple times)")
+	flag.Var(&recipients, "to", "set To addresses (can be used multiple times)")
 	flag.Parse()
 
 	if *subject_flag == "" {
@@ -207,7 +209,7 @@ func main() {
 					defer f.Close()
 				}
 			}
-			if e := generate_eml(user_email, g, commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
+			if e := generate_eml(user_email, recipients, g, commit_object, cid, commit_time, pdfbuf, gzbuf); e != nil {
 				panic(e)
 			}
 		}
@@ -338,7 +340,18 @@ func generate_files(commit_object *object.Commit, cid string, commit_time time.T
 	return nil
 }
 
-func generate_eml(user_email *mail.Address, g io.Writer, commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
+func generate_eml(user_email *mail.Address, recipients []string, g io.Writer, commit_object *object.Commit, cid string, commit_time time.Time, pdfbuf *bytes.Buffer, gzbuf io.Reader) error {
+	parsed_recipients := make([]*mail.Address, 0, 4)
+	if len(recipients) > 0 {
+		for _, x := range recipients {
+			if a, e := mail.ParseAddress(x); e != nil {
+				return e
+			} else {
+				parsed_recipients = append(parsed_recipients, a)
+			}
+		}
+	}
+
 	m := multipart.NewWriter(g)
 	randy := rand.Reader
 	m_id := make([]byte, 18)
@@ -351,7 +364,20 @@ func generate_eml(user_email *mail.Address, g io.Writer, commit_object *object.C
 
 	message_headers := make(map[string]string)
 	message_headers["From"] = user_email.String()
-	message_headers["To"] = user_email.String()
+	if len(parsed_recipients) > 0 {
+		var collection string
+		for i, x := range parsed_recipients {
+			if i > 0 {
+				collection = fmt.Sprintf("%s, %s", collection, x.String())
+			} else {
+				collection = x.String()
+			}
+		}
+		message_headers["To"] = collection
+		message_headers["Cc"] = user_email.String()
+	} else {
+		message_headers["To"] = user_email.String()
+	}
 	message_headers["Subject"] = *subject_flag
 	message_headers["Date"] = time.Now().Format(time.RFC1123Z)
 	message_headers["MIME-Version"] = "1.1"
@@ -360,7 +386,7 @@ func generate_eml(user_email *mail.Address, g io.Writer, commit_object *object.C
 
 	for k, key := range message_header_list {
 		if a, ok := message_headers[key]; ok {
-			if k < 3 {
+			if k < 4 {
 				fmt.Fprintf(os.Stderr, "%s: %s\r\n", key, a)
 			}
 			fmt.Fprintf(g, "%s: %s\r\n", key, a)
