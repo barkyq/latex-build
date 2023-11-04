@@ -355,7 +355,7 @@ func generate_eml(user_email *mail.Address, g io.Writer, commit_object *object.C
 	message_headers["Subject"] = *subject_flag
 	message_headers["Date"] = time.Now().Format(time.RFC1123Z)
 	message_headers["MIME-Version"] = "1.1"
-	message_headers["Message-ID"] = fmt.Sprintf("%08x-%04x-%04x-%04x-%016x@liouville.net", m_id[0:4], m_id[4:6], m_id[6:8], m_id[8:10], m_id[10:18])
+	message_headers["Message-ID"] = fmt.Sprintf("<%08x-%04x-%04x-%04x-%016x@liouville.net>", m_id[0:4], m_id[4:6], m_id[6:8], m_id[8:10], m_id[10:18])
 	message_headers["Content-Type"] = fmt.Sprintf("multipart/mixed; boundary=\"%s\"", m.Boundary())
 
 	for k, key := range message_header_list {
