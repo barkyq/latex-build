@@ -135,7 +135,7 @@ func main() {
 				return e
 			} else if g, e := os.Create(gname); e != nil {
 				return e
-			} else if n, e := write_to_tmp_dir(r, g, f.Name, commit_hash.String()); e != nil {
+			} else if n, e := write_to_tmp_dir(r, g, f.Name, commit_hash.String(), commit_time); e != nil {
 				return e
 			} else if *release_flag {
 				// if release, do not write anything to tar writer yet
@@ -494,7 +494,7 @@ func filename_filter(s string, xs []string) bool {
 	return true
 }
 
-func write_to_tmp_dir(r io.ReadCloser, fi *os.File, name string, hash string) (n int64, e error) {
+func write_to_tmp_dir(r io.ReadCloser, fi *os.File, name string, hash string, commit_time time.Time) (n int64, e error) {
 	switch name {
 	case "main.tex":
 		rb := bufio.NewReader(r)
@@ -510,7 +510,7 @@ func write_to_tmp_dir(r io.ReadCloser, fi *os.File, name string, hash string) (n
 				if strings.Contains(fmt.Sprintf("%s", l), "documentclass") {
 					if !(*release_flag) {
 						// only write the atbegshi if not an arXiv release
-						if k, er := fmt.Fprintf(fi, "\\usepackage{atbegshi}\n\\AtBeginShipoutNext{\\AtBeginShipoutUpperLeft{\\put(1.25in,-1in){\\makebox[0pt][l]{{\\tt %s %s}}}}}\n", hash[:8], time.Now().Format("15:04:05\\ 2006-01-02")); er != nil {
+						if k, er := fmt.Fprintf(fi, "\\usepackage{atbegshi}\n\\AtBeginShipoutNext{\\AtBeginShipoutUpperLeft{\\put(1.25in,-1in){\\makebox[0pt][l]{{\\tt %s %s}}}}}\n", hash[:8], commit_time.Format("15:04:05\\ 2006-01-02")); er != nil {
 							return n + int64(k), er
 						} else {
 							n += int64(k)
